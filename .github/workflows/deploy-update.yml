@@ -1,0 +1,133 @@
+name: Sync with upstream
+
+# Merges the upstream Mailflare repository into this fork's default branch.
+# Runs daily, on demand, and from the admin dashboard's update button (which
+# dispatches this file by name, see src/app/api/admin/update/utils.ts).
+#
+# A clean merge is pushed straight to the default branch, so the connected
+# Cloudflare Git integration deploys it. A merge with conflicts is left as a
+# pull request from the `upstream-sync` branch for manual resolution.
+#
+# Secrets / variables (all optional):
+#   MAILFLARE_UPDATE_TOKEN  PAT with contents, pull-requests and workflows
+#                           write. Needed when upstream changes files under
+#                           .github/workflows (GITHUB_TOKEN may not push those).
+#   UPSTREAM_REPOSITORY     owner/repo to sync from (default hieunc229/mailflare)
+#   UPSTREAM_BRANCH         upstream branch (default: its default branch)
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPOSITORY: ${{ vars.UPSTREAM_REPOSITORY || 'hieunc229/mailflare' }}
+      UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH }}
+      SYNC_BRANCH: upstream-sync
+      GH_TOKEN: ${{ secrets.MAILFLARE_UPDATE_TOKEN || github.token }}
+
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.MAILFLARE_UPDATE_TOKEN || github.token }}
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          branch="${UPSTREAM_BRANCH}"
+          if [ -z "${branch}" ]; then
+            branch="$(git ls-remote --symref upstream HEAD | sed -n 's|^ref: refs/heads/\(.*\)\tHEAD$|\1|p')"
+          fi
+          if [ -z "${branch}" ]; then
+            echo "::error::Could not resolve the default branch of ${UPSTREAM_REPOSITORY}."
+            exit 1
+          fi
+          git fetch --no-tags upstream "+refs/heads/${branch}:refs/remotes/upstream/${branch}"
+
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse "upstream/${branch}")" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "upstream/${branch}" HEAD; then
+            echo "Already up to date with ${UPSTREAM_REPOSITORY}@${branch}."
+            echo "behind=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "behind=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.fetch.outputs.behind == 'true'
+        env:
+          BRANCH: ${{ steps.fetch.outputs.branch }}
+        run: |
+          set -euo pipefail
+          if git merge --no-edit --allow-unrelated-histories \
+              -m "Merge ${UPSTREAM_REPOSITORY}@${BRANCH} into ${GITHUB_REF_NAME}" \
+              "upstream/${BRANCH}"; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Merge conflicts in: $(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+            git merge --abort
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push merge
+        if: steps.merge.outputs.clean == 'true'
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"
+          # A clean sync supersedes any pending conflict PR.
+          git push origin --delete "${SYNC_BRANCH}" 2>/dev/null || true
+          echo "### Synced with ${UPSTREAM_REPOSITORY}@${{ steps.fetch.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open pull request for conflicts
+        if: steps.merge.outputs.clean == 'false'
+        env:
+          BRANCH: ${{ steps.fetch.outputs.branch }}
+          SHA: ${{ steps.fetch.outputs.sha }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git push --force origin "upstream/${BRANCH}:refs/heads/${SYNC_BRANCH}"
+
+          existing="$(gh pr list --head "${SYNC_BRANCH}" --base "${BASE}" --state open --json url --jq '.[0].url')"
+          if [ -n "${existing}" ]; then
+            echo "Updated existing pull request ${existing}"
+            echo "### Conflicts: updated ${existing}" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          body="$(cat <<BODY
+          Automatic sync from \`${UPSTREAM_REPOSITORY}@${BRANCH}\` (${SHA}) could not be merged cleanly.
+
+          Resolve the conflicts locally, keeping this fork's own settings (for example \`wrangler.jsonc\` IDs):
+
+          \`\`\`bash
+          git fetch origin ${SYNC_BRANCH}
+          git checkout ${BASE}
+          git merge --allow-unrelated-histories origin/${SYNC_BRANCH}
+          \`\`\`
+          BODY
+          )"
+          url="$(gh pr create --head "${SYNC_BRANCH}" --base "${BASE}" \
+            --title "Sync with upstream ${UPSTREAM_REPOSITORY}" --body "${body}")"
+          echo "### Conflicts: opened ${url}" >> "$GITHUB_STEP_SUMMARY"
